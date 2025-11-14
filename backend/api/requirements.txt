@@ -1,0 +1,38 @@
+# PantryPal ML API - Production Requirements
+# Generated: November 13, 2025
+
+# Web Framework
+flask==3.0.0
+flask-cors==6.0.1
+gunicorn==21.2.0
+
+# ML Libraries
+torch==2.5.1
+torchvision==0.20.1
+sentence-transformers==5.1.2
+faiss-cpu==1.12.0
+lightgbm==4.5.0
+
+# Data Processing
+pandas==2.2.3
+numpy==2.2.1
+scikit-learn==1.6.0
+
+# Text Processing
+rapidfuzz==3.14.3
+
+# Utilities
+python-dateutil==2.9.0.post0
+joblib==1.4.2
+
+# Monitoring & Logging (Optional)
+prometheus-flask-exporter==0.23.0
+sentry-sdk[flask]==1.45.0
+
+# Security (Recommended for Production)
+flask-jwt-extended==4.6.0
+flask-limiter==3.5.0
+
+# Testing
+pytest==8.3.3
+requests==2.32.3

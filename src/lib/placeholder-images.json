@@ -1,0 +1,34 @@
+{
+  "placeholderImages": [
+    {
+      "id": "recipe-1",
+      "description": "Banana bread",
+      "imageUrl": "https://images.unsplash.com/photo-1701727080961-00e8c9086e45?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3NDE5ODJ8MHwxfHNlYXJjaHwxMHx8YmFuYW5hJTIwYnJlYWR8ZW58MHx8fHwxNzYyNzkyMjMxfDA&ixlib=rb-4.1.0&q=80&w=1080",
+      "imageHint": "banana bread"
+    },
+    {
+      "id": "recipe-2",
+      "description": "Avocado toast",
+      "imageUrl": "https://images.unsplash.com/photo-1623691752472-a6d33855e5de?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3NDE5ODJ8MHwxfHNlYXJjaHw5fHxhdm9jYWRvJTIwdG9hc3R8ZW58MHx8fHwxNzYyNzk5MDAzfDA&ixlib=rb-4.1.0&q=80&w=1080",
+      "imageHint": "avocado toast"
+    },
+    {
+      "id": "recipe-3",
+      "description": "French toast",
+      "imageUrl": "https://images.unsplash.com/photo-1631359544940-535dcc2dc72c?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3NDE5ODJ8MHwxfHNlYXJjaHwzfHxmcmVuY2glMjB0b2FzdHxlbnwwfHx8fDE3NjI4NDM3MTZ8MA&ixlib=rb-4.1.0&q=80&w=1080",
+      "imageHint": "french toast"
+    },
+    {
+      "id": "recipe-4",
+      "description": "Spinach Omelette",
+      "imageUrl": "https://images.unsplash.com/photo-1728777187226-a8f7f6d31cbc?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3NDE5ODJ8MHwxfHNlYXJjaHwyfHxzcGluYWNoJTIwb21lbGV0dGV8ZW58MHx8fHwxNzYyODA5OTg5fDA&ixlib=rb-4.1.0&q=80&w=1080",
+      "imageHint": "spinach omelette"
+    },
+    {
+      "id": "user-avatar",
+      "description": "User avatar",
+      "imageUrl": "https://images.unsplash.com/photo-1544005313-94ddf0286df2?crop=entropy&cs=tinysrgb&fit=max&fm=jpg&ixid=M3w3NDE5ODJ8MHwxfHNlYXJjaHw4fHxwZXJzb24lMjBwb3J0cmFpdHxlbnwwfHx8fDE3NjI4MDgwNTN8MA&ixlib=rb-4.1.0&q=80&w=1080",
+      "imageHint": "person portrait"
+    }
+  ]
+}

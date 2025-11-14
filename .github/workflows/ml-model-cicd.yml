@@ -1,0 +1,482 @@
+# ============================================================================
+# PantryPal ML Model CI/CD Pipeline
+# 
+# Stages:
+# 1. Model Training Validation
+# 2. Model Performance Tests
+# 3. Build BentoML Bundle
+# 4. Canary Deployment (10% → 100%)
+# 5. Rollback on Failure
+# ============================================================================
+
+name: ML Model CI/CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'backend/ml/**'
+      - 'backend/ml_deployment/**'
+      - '.github/workflows/ml-model-cicd.yml'
+  workflow_dispatch:
+    inputs:
+      deployment_strategy:
+        description: 'Deployment strategy'
+        required: true
+        default: 'canary'
+        type: choice
+        options:
+          - canary
+          - blue-green
+          - rolling
+
+env:
+  PYTHON_VERSION: '3.11'
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGISTRY: gcr.io
+  IMAGE_NAME: ml-model-server
+  GCP_REGION: us-central1
+  MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+  MODEL_BUCKET: ${{ secrets.GCS_MODEL_BUCKET }}
+
+jobs:
+  # ==========================================================================
+  # Stage 1: Model Training Validation
+  # ==========================================================================
+  validate-training:
+    name: Validate Model Training
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: |
+          pip install -r backend/ml/requirements.txt
+          pip install pytest mlflow
+      
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      
+      - name: Run training pipeline (sample data)
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ steps.auth.outputs.credentials_file_path }}
+        run: |
+          python backend/ml/training_pipeline.py \
+            --mode=validation \
+            --data-size=1000 \
+            --max-trials=5
+      
+      - name: Validate model artifacts
+        run: |
+          python -c "
+          import mlflow
+          import os
+          
+          mlflow.set_tracking_uri(os.getenv('MLFLOW_TRACKING_URI'))
+          
+          # Get latest run
+          runs = mlflow.search_runs(order_by=['start_time DESC'], max_results=1)
+          assert len(runs) > 0, 'No training runs found'
+          
+          run_id = runs.iloc[0]['run_id']
+          metrics = runs.iloc[0]
+          
+          # Validate metrics
+          assert metrics['metrics.test_auc'] > 0.80, f\"AUC too low: {metrics['metrics.test_auc']}\"
+          assert metrics['metrics.test_precision'] > 0.75, f\"Precision too low: {metrics['metrics.test_precision']}\"
+          assert metrics['metrics.test_recall'] > 0.70, f\"Recall too low: {metrics['metrics.test_recall']}\"
+          
+          print(f'✅ Model validation passed (AUC: {metrics[\"metrics.test_auc\"]:.3f})')
+          "
+
+  # ==========================================================================
+  # Stage 2: Model Performance Tests
+  # ==========================================================================
+  performance-tests:
+    name: Model Performance Tests
+    runs-on: ubuntu-latest
+    needs: validate-training
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install dependencies
+        run: |
+          pip install -r backend/ml/requirements.txt
+          pip install locust pytest-benchmark
+      
+      - name: Load test model
+        run: |
+          python -c "
+          import mlflow
+          import time
+          import numpy as np
+          
+          mlflow.set_tracking_uri('${{ env.MLFLOW_TRACKING_URI }}')
+          
+          # Load latest production model
+          model = mlflow.pyfunc.load_model('models:/waste-prediction/production')
+          
+          # Warm-up
+          sample = np.random.rand(1, 10)
+          _ = model.predict(sample)
+          
+          # Latency test (p99 < 100ms)
+          latencies = []
+          for _ in range(100):
+              start = time.time()
+              _ = model.predict(sample)
+              latencies.append((time.time() - start) * 1000)
+          
+          p99 = np.percentile(latencies, 99)
+          avg = np.mean(latencies)
+          
+          assert p99 < 100, f'P99 latency too high: {p99:.2f}ms'
+          assert avg < 50, f'Average latency too high: {avg:.2f}ms'
+          
+          print(f'✅ Performance test passed (Avg: {avg:.2f}ms, P99: {p99:.2f}ms)')
+          "
+      
+      - name: Memory profiling
+        run: |
+          python -c "
+          import mlflow
+          import psutil
+          import os
+          
+          mlflow.set_tracking_uri('${{ env.MLFLOW_TRACKING_URI }}')
+          
+          # Measure memory before loading
+          process = psutil.Process(os.getpid())
+          mem_before = process.memory_info().rss / 1024 / 1024  # MB
+          
+          # Load model
+          model = mlflow.pyfunc.load_model('models:/waste-prediction/production')
+          
+          # Measure memory after loading
+          mem_after = process.memory_info().rss / 1024 / 1024  # MB
+          mem_usage = mem_after - mem_before
+          
+          assert mem_usage < 500, f'Model memory usage too high: {mem_usage:.2f}MB'
+          
+          print(f'✅ Memory test passed (Model size: {mem_usage:.2f}MB)')
+          "
+
+  # ==========================================================================
+  # Stage 3: Build BentoML Bundle
+  # ==========================================================================
+  build-bento:
+    name: Build BentoML Bundle
+    runs-on: ubuntu-latest
+    needs: performance-tests
+    
+    outputs:
+      bento_tag: ${{ steps.build.outputs.tag }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install BentoML
+        run: |
+          pip install bentoml mlflow
+      
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      
+      - name: Build Bento
+        id: build
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ steps.auth.outputs.credentials_file_path }}
+        run: |
+          cd backend/ml_deployment
+          
+          # Build Bento
+          bentoml build
+          
+          # Get Bento tag
+          BENTO_TAG=$(bentoml list waste-predictor --output=json | jq -r '.[0].tag')
+          echo "tag=$BENTO_TAG" >> $GITHUB_OUTPUT
+          
+          echo "✅ Built Bento: $BENTO_TAG"
+      
+      - name: Containerize Bento
+        run: |
+          cd backend/ml_deployment
+          
+          # Containerize
+          bentoml containerize ${{ steps.build.outputs.tag }} \
+            --image-tag ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+      
+      - name: Authenticate to GCR
+        run: |
+          gcloud auth configure-docker
+      
+      - name: Push to GCR
+        run: |
+          docker push ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+      
+      - name: Tag as candidate
+        run: |
+          docker tag \
+            ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:candidate
+          
+          docker push ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:candidate
+
+  # ==========================================================================
+  # Stage 4: Canary Deployment (10% → 50% → 100%)
+  # ==========================================================================
+  canary-deploy:
+    name: Canary Deployment
+    runs-on: ubuntu-latest
+    needs: build-bento
+    environment:
+      name: production
+      url: https://pantrypal.app
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+      
+      - name: Get GKE credentials
+        run: |
+          gcloud container clusters get-credentials pantrypal-production-gke \
+            --region ${{ env.GCP_REGION }} \
+            --project ${{ env.PROJECT_ID }}
+      
+      # Phase 1: 10% traffic
+      - name: Deploy canary (10%)
+        run: |
+          # Create canary deployment
+          kubectl apply -f - <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ml-server-canary
+            namespace: pantrypal-production
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: ml-server
+                version: canary
+            template:
+              metadata:
+                labels:
+                  app: ml-server
+                  version: canary
+              spec:
+                containers:
+                - name: ml-server
+                  image: ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+                  ports:
+                  - containerPort: 3000
+          EOF
+          
+          # Update service to route 10% to canary
+          kubectl patch service ml-server -n pantrypal-production --type=json -p='[
+            {"op": "add", "path": "/spec/selector/version", "value": null}
+          ]'
+          
+          # Apply Istio VirtualService for traffic split
+          kubectl apply -f - <<EOF
+          apiVersion: networking.istio.io/v1beta1
+          kind: VirtualService
+          metadata:
+            name: ml-server
+            namespace: pantrypal-production
+          spec:
+            hosts:
+            - ml-server
+            http:
+            - match:
+              - headers:
+                  canary:
+                    exact: "true"
+              route:
+              - destination:
+                  host: ml-server
+                  subset: canary
+            - route:
+              - destination:
+                  host: ml-server
+                  subset: stable
+                weight: 90
+              - destination:
+                  host: ml-server
+                  subset: canary
+                weight: 10
+          EOF
+      
+      - name: Monitor canary (10%) - 5 minutes
+        run: |
+          echo "Monitoring canary deployment (10% traffic) for 5 minutes..."
+          sleep 300
+          
+          # Check error rate
+          ERROR_RATE=$(kubectl logs -n pantrypal-production -l version=canary --tail=1000 | grep -c "ERROR" || echo 0)
+          
+          if [ $ERROR_RATE -gt 10 ]; then
+            echo "❌ High error rate detected: $ERROR_RATE errors"
+            exit 1
+          fi
+          
+          echo "✅ Canary (10%) looks healthy"
+      
+      # Phase 2: 50% traffic
+      - name: Increase canary to 50%
+        run: |
+          kubectl apply -f - <<EOF
+          apiVersion: networking.istio.io/v1beta1
+          kind: VirtualService
+          metadata:
+            name: ml-server
+            namespace: pantrypal-production
+          spec:
+            hosts:
+            - ml-server
+            http:
+            - route:
+              - destination:
+                  host: ml-server
+                  subset: stable
+                weight: 50
+              - destination:
+                  host: ml-server
+                  subset: canary
+                weight: 50
+          EOF
+      
+      - name: Monitor canary (50%) - 10 minutes
+        run: |
+          echo "Monitoring canary deployment (50% traffic) for 10 minutes..."
+          sleep 600
+          
+          ERROR_RATE=$(kubectl logs -n pantrypal-production -l version=canary --tail=2000 | grep -c "ERROR" || echo 0)
+          
+          if [ $ERROR_RATE -gt 20 ]; then
+            echo "❌ High error rate detected: $ERROR_RATE errors"
+            exit 1
+          fi
+          
+          echo "✅ Canary (50%) looks healthy"
+      
+      # Phase 3: 100% traffic (promote canary)
+      - name: Promote canary to 100%
+        run: |
+          # Update stable deployment with new image
+          kubectl set image deployment/ml-server \
+            ml-server=${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            -n pantrypal-production
+          
+          # Wait for rollout
+          kubectl rollout status deployment/ml-server -n pantrypal-production --timeout=10m
+          
+          # Remove canary deployment
+          kubectl delete deployment ml-server-canary -n pantrypal-production
+          
+          # Restore normal routing
+          kubectl delete virtualservice ml-server -n pantrypal-production
+      
+      - name: Tag as production
+        run: |
+          docker tag \
+            ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:production
+          
+          docker push ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:production
+      
+      - name: Notify Slack
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          custom_payload: |
+            {
+              text: "🚀 ML model deployed to production",
+              attachments: [{
+                color: 'good',
+                text: `Bento: ${{ needs.build-bento.outputs.bento_tag }}\nCommit: ${process.env.AS_COMMIT}`
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+
+  # ==========================================================================
+  # Rollback on Failure
+  # ==========================================================================
+  rollback:
+    name: Rollback Canary
+    runs-on: ubuntu-latest
+    if: failure()
+    needs: canary-deploy
+    
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+      
+      - name: Get GKE credentials
+        run: |
+          gcloud container clusters get-credentials pantrypal-production-gke \
+            --region ${{ env.GCP_REGION }} \
+            --project ${{ env.PROJECT_ID }}
+      
+      - name: Rollback canary
+        run: |
+          # Delete canary deployment
+          kubectl delete deployment ml-server-canary -n pantrypal-production || true
+          
+          # Restore normal routing
+          kubectl delete virtualservice ml-server -n pantrypal-production || true
+          
+          echo "✅ Canary deployment rolled back"
+      - name: Notify Slack
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          custom_payload: |
+            {
+              text: "🚨 ML model canary deployment failed and was rolled back",
+              attachments: [{
+                color: 'danger',
+                text: `Commit ${process.env.AS_COMMIT} failed canary validation`
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}

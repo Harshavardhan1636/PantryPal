@@ -1,0 +1,404 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  TERRAFORM_VERSION: 1.6.0
+
+jobs:
+  # =======================
+  # LINT & TEST
+  # =======================
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      
+      - name: Install Python dependencies
+        run: |
+          cd backend
+          pip install flake8 black pytest pytest-cov
+          if [ -f auth_service/requirements.txt ]; then pip install -r auth_service/requirements.txt; fi
+          if [ -f inventory_service/requirements.txt ]; then pip install -r inventory_service/requirements.txt; fi
+          if [ -f api/requirements.txt ]; then pip install -r api/requirements.txt; fi
+      
+      - name: Lint Python (Black)
+        run: |
+          cd backend
+          black --check .
+      
+      - name: Lint Python (Flake8)
+        run: |
+          cd backend
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+      
+      - name: Install frontend dependencies
+        run: npm install
+      
+      - name: Lint TypeScript
+        run: npm run lint
+      
+      - name: Type check
+        run: npm run type-check || true
+      
+      - name: Run Python tests
+        run: |
+          cd backend
+          pytest --cov=. --cov-report=xml
+      
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./backend/coverage.xml
+
+  # =======================
+  # BUILD DOCKER IMAGES
+  # =======================
+  build-images:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    if: github.event_name == 'push'
+    
+    permissions:
+      contents: read
+      packages: write
+    
+    strategy:
+      matrix:
+        service:
+          - auth_service
+          - inventory_service
+          - api
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.service }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-
+            type=semver,pattern={{version}}
+      
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend/${{ matrix.service }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # =======================
+  # BUILD ML BENTO
+  # =======================
+  build-ml-bento:
+    name: Build ML Bento
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    if: github.event_name == 'push'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install BentoML
+        run: pip install bentoml
+      
+      - name: Build Bento
+        run: |
+          cd ml-service
+          bentoml build
+      
+      - name: Export Bento as Docker
+        run: |
+          bentoml containerize waste_risk_predictor:latest \
+            -t ${{ env.REGISTRY }}/${{ github.repository }}/ml-service:${{ github.sha }}
+      
+      - name: Push Bento Docker image
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+          docker push ${{ env.REGISTRY }}/${{ github.repository }}/ml-service:${{ github.sha }}
+
+  # =======================
+  # BUILD FRONTEND
+  # =======================
+  build-frontend:
+    name: Build Frontend
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    if: github.event_name == 'push'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Build Next.js app
+        run: npm run build
+        env:
+          NEXT_PUBLIC_API_URL: ${{ secrets.API_URL }}
+      
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-build
+          path: .next
+          retention-days: 7
+
+  # =======================
+  # TERRAFORM PLAN (Staging)
+  # =======================
+  terraform-plan-staging:
+    name: Terraform Plan (Staging)
+    runs-on: ubuntu-latest
+    needs: [build-images, build-ml-bento]
+    if: github.ref == 'refs/heads/develop'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+      
+      - name: Configure GCP credentials
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS_STAGING }}
+      
+      - name: Terraform Init
+        run: |
+          cd infrastructure/terraform
+          terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET_STAGING }}"
+      
+      - name: Terraform Plan
+        run: |
+          cd infrastructure/terraform
+          terraform plan \
+            -var="environment=staging" \
+            -var="project_id=${{ secrets.GCP_PROJECT_ID_STAGING }}" \
+            -out=tfplan
+      
+      - name: Upload Terraform plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-staging
+          path: infrastructure/terraform/tfplan
+          retention-days: 7
+
+  # =======================
+  # DEPLOY TO STAGING
+  # =======================
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: terraform-plan-staging
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+      
+      - name: Configure GCP credentials
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS_STAGING }}
+      
+      - name: Download Terraform plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-staging
+          path: infrastructure/terraform
+      
+      - name: Terraform Apply
+        run: |
+          cd infrastructure/terraform
+          terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET_STAGING }}"
+          terraform apply tfplan
+      
+      - name: Get GKE credentials
+        run: |
+          gcloud container clusters get-credentials pantrypal-gke \
+            --region us-central1 \
+            --project ${{ secrets.GCP_PROJECT_ID_STAGING }}
+      
+      - name: Deploy to Kubernetes
+        run: |
+          kubectl apply -f infrastructure/k8s/staging/
+          kubectl set image deployment/auth-service auth=${{ env.REGISTRY }}/${{ github.repository }}/auth_service:${{ github.sha }}
+          kubectl set image deployment/inventory-service inventory=${{ env.REGISTRY }}/${{ github.repository }}/inventory_service:${{ github.sha }}
+          kubectl set image deployment/api-service api=${{ env.REGISTRY }}/${{ github.repository }}/api:${{ github.sha }}
+          kubectl rollout status deployment/auth-service
+          kubectl rollout status deployment/inventory-service
+          kubectl rollout status deployment/api-service
+
+  # =======================
+  # INTEGRATION TESTS
+  # =======================
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install test dependencies
+        run: pip install pytest httpx
+      
+      - name: Run integration tests
+        run: |
+          pytest tests/integration/ \
+            --base-url=https://api-staging.pantrypal.app
+        env:
+          TEST_API_KEY: ${{ secrets.TEST_API_KEY_STAGING }}
+
+  # =======================
+  # DEPLOY TO PRODUCTION
+  # =======================
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: integration-tests
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+      
+      - name: Configure GCP credentials
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS_PROD }}
+      
+      - name: Terraform Init
+        run: |
+          cd infrastructure/terraform
+          terraform init -backend-config="bucket=${{ secrets.TF_STATE_BUCKET_PROD }}"
+      
+      - name: Terraform Plan
+        run: |
+          cd infrastructure/terraform
+          terraform plan \
+            -var="environment=production" \
+            -var="project_id=${{ secrets.GCP_PROJECT_ID_PROD }}" \
+            -out=tfplan
+      
+      - name: Terraform Apply
+        run: |
+          cd infrastructure/terraform
+          terraform apply -auto-approve tfplan
+      
+      - name: Blue-Green Deployment
+        run: |
+          gcloud container clusters get-credentials pantrypal-gke \
+            --region us-central1 \
+            --project ${{ secrets.GCP_PROJECT_ID_PROD }}
+          
+          # Deploy green version
+          kubectl apply -f infrastructure/k8s/production/
+          kubectl set image deployment/auth-service-green auth=${{ env.REGISTRY }}/${{ github.repository }}/auth_service:${{ github.sha }}
+          
+          # Wait for rollout
+          kubectl rollout status deployment/auth-service-green
+          
+          # Switch traffic
+          kubectl patch service auth-service -p '{"spec":{"selector":{"version":"green"}}}'
+          
+          # Delete old blue deployment
+          kubectl delete deployment auth-service-blue || true
+
+  # =======================
+  # NOTIFY
+  # =======================
+  notify:
+    name: Notify Deployment
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-production]
+    if: always()
+    
+    steps:
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "PantryPal Deployment",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "Deployment Status: ${{ job.status }}\nBranch: ${{ github.ref }}\nCommit: ${{ github.sha }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

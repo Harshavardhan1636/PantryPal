@@ -1,0 +1,203 @@
+# Docker Compose for ML Infrastructure
+#
+# Services:
+# - MLflow Tracking Server (model registry)
+# - PostgreSQL (MLflow backend)
+# - Redis (caching & deduplication)
+# - Prometheus (metrics collection)
+# - Grafana (visualization)
+
+version: '3.8'
+
+services:
+  
+  # ============================================================================
+  # MLflow Tracking Server
+  # ============================================================================
+  
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.8.0
+    container_name: pantrypal-mlflow
+    ports:
+      - "5000:5000"
+    environment:
+      # Backend store (PostgreSQL)
+      MLFLOW_BACKEND_STORE_URI: postgresql://postgres:password@postgres:5432/mlflow
+      
+      # Artifact storage (local for dev, S3 for prod)
+      MLFLOW_ARTIFACT_ROOT: /mlflow/artifacts
+      
+      # AWS credentials (for S3 artifact storage in production)
+      # AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      # AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      # AWS_DEFAULT_REGION: us-east-1
+    
+    command: >
+      mlflow server
+      --backend-store-uri postgresql://postgres:password@postgres:5432/mlflow
+      --default-artifact-root /mlflow/artifacts
+      --host 0.0.0.0
+      --port 5000
+    
+    volumes:
+      - mlflow-artifacts:/mlflow/artifacts
+    
+    depends_on:
+      - postgres
+    
+    networks:
+      - pantrypal-network
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+  
+  # ============================================================================
+  # PostgreSQL (MLflow backend)
+  # ============================================================================
+  
+  postgres:
+    image: postgres:15-alpine
+    container_name: pantrypal-postgres-mlflow
+    ports:
+      - "5433:5432"  # Use 5433 to avoid conflict with main DB
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: mlflow
+    
+    volumes:
+      - postgres-mlflow-data:/var/lib/postgresql/data
+    
+    networks:
+      - pantrypal-network
+    
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  
+  # ============================================================================
+  # Redis (caching & deduplication)
+  # ============================================================================
+  
+  redis:
+    image: redis:7-alpine
+    container_name: pantrypal-redis
+    ports:
+      - "6379:6379"
+    
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    
+    volumes:
+      - redis-data:/data
+    
+    networks:
+      - pantrypal-network
+    
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+  
+  # ============================================================================
+  # Prometheus (metrics collection)
+  # ============================================================================
+  
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: pantrypal-prometheus
+    ports:
+      - "9090:9090"
+    
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    
+    networks:
+      - pantrypal-network
+    
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+  
+  # ============================================================================
+  # Grafana (visualization)
+  # ============================================================================
+  
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: pantrypal-grafana
+    ports:
+      - "3001:3000"  # Use 3001 to avoid conflict with Next.js
+    
+    environment:
+      # Admin credentials
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      
+      # Anonymous access
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      
+      # Data sources
+      GF_DATASOURCES_DEFAULT_NAME: Prometheus
+    
+    volumes:
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - grafana-data:/var/lib/grafana
+    
+    depends_on:
+      - prometheus
+    
+    networks:
+      - pantrypal-network
+    
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+# ============================================================================
+# Volumes
+# ============================================================================
+
+volumes:
+  mlflow-artifacts:
+    driver: local
+  
+  postgres-mlflow-data:
+    driver: local
+  
+  redis-data:
+    driver: local
+  
+  prometheus-data:
+    driver: local
+  
+  grafana-data:
+    driver: local
+
+# ============================================================================
+# Networks
+# ============================================================================
+
+networks:
+  pantrypal-network:
+    driver: bridge

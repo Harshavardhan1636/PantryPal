@@ -1,0 +1,484 @@
+# ============================================================================
+# PantryPal Backend CI/CD Pipeline
+# 
+# Stages:
+# 1. Lint & Format Check
+# 2. Unit Tests
+# 3. Security Scanning
+# 4. Build Docker Image
+# 5. Integration Tests
+# 6. Push to Registry
+# 7. Deploy to Staging
+# 8. E2E Tests
+# 9. Deploy to Production (manual approval)
+# ============================================================================
+
+name: Backend CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'backend/**'
+      - '.github/workflows/backend-cicd.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'backend/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  PYTHON_VERSION: '3.11'
+  POETRY_VERSION: '1.7.1'
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGISTRY: gcr.io
+  IMAGE_NAME: backend
+  STAGING_CLUSTER: pantrypal-staging-gke
+  PRODUCTION_CLUSTER: pantrypal-production-gke
+  GCP_REGION: us-central1
+
+jobs:
+  # ==========================================================================
+  # Stage 1: Lint & Format Check
+  # ==========================================================================
+  lint:
+    name: Lint & Format Check
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Cache Poetry dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pypoetry
+          key: ${{ runner.os }}-poetry-${{ hashFiles('**/poetry.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-poetry-
+      
+      - name: Install Poetry
+        run: |
+          curl -sSL https://install.python-poetry.org | python3 -
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+      
+      - name: Install dependencies
+        working-directory: ./backend
+        run: |
+          poetry config virtualenvs.create false
+          poetry install --with dev
+      
+      - name: Run Black (format check)
+        working-directory: ./backend
+        run: poetry run black --check .
+      
+      - name: Run isort (import sort check)
+        working-directory: ./backend
+        run: poetry run isort --check-only .
+      
+      - name: Run Flake8 (linting)
+        working-directory: ./backend
+        run: poetry run flake8 . --max-line-length=100 --exclude=.venv
+      
+      - name: Run mypy (type checking)
+        working-directory: ./backend
+        run: poetry run mypy . --ignore-missing-imports
+
+  # ==========================================================================
+  # Stage 2: Unit Tests
+  # ==========================================================================
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: pantrypal_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install Poetry
+        run: |
+          curl -sSL https://install.python-poetry.org | python3 -
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+      
+      - name: Install dependencies
+        working-directory: ./backend
+        run: |
+          poetry config virtualenvs.create false
+          poetry install --with dev
+      
+      - name: Run pytest
+        working-directory: ./backend
+        env:
+          DATABASE_URL: postgresql://test:test@localhost:5432/pantrypal_test
+          REDIS_URL: redis://localhost:6379/0
+          JWT_SECRET: test-secret-key
+          ENVIRONMENT: test
+        run: |
+          poetry run pytest \
+            --cov=backend \
+            --cov-report=xml \
+            --cov-report=html \
+            --cov-report=term \
+            --junit-xml=junit.xml \
+            -v
+      
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./backend/coverage.xml
+          flags: backend
+          name: backend-coverage
+      
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: ./backend/junit.xml
+
+  # ==========================================================================
+  # Stage 3: Security Scanning
+  # ==========================================================================
+  security:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    needs: lint
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Run Snyk security scan
+        uses: snyk/actions/python@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high
+      
+      - name: Run Bandit security scan
+        run: |
+          pip install bandit
+          bandit -r backend/ -f json -o bandit-report.json || true
+      
+      - name: Upload Bandit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-report
+          path: bandit-report.json
+      
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: './backend'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+      
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # ==========================================================================
+  # Stage 4: Build Docker Image
+  # ==========================================================================
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.build.outputs.digest }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      
+      - name: Configure Docker for GCR
+        run: |
+          gcloud auth configure-docker
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ github.ref_name }}
+      
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-image-results.sarif'
+      
+      - name: Upload Trivy image scan results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-image-results.sarif'
+
+  # ==========================================================================
+  # Stage 5: Deploy to Staging
+  # ==========================================================================
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/develop' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+      
+      - name: Get GKE credentials
+        run: |
+          gcloud container clusters get-credentials ${{ env.STAGING_CLUSTER }} \
+            --region ${{ env.GCP_REGION }} \
+            --project ${{ env.PROJECT_ID }}
+      
+      - name: Update deployment image
+        run: |
+          kubectl set image deployment/backend-api \
+            backend-api=${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            -n pantrypal-staging
+      
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/backend-api \
+            -n pantrypal-staging \
+            --timeout=5m
+      
+      - name: Verify deployment
+        run: |
+          kubectl get pods -n pantrypal-staging -l app=backend-api
+          kubectl logs -n pantrypal-staging -l app=backend-api --tail=50
+
+  # ==========================================================================
+  # Stage 6: Integration Tests (Staging)
+  # ==========================================================================
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install test dependencies
+        run: |
+          pip install pytest requests
+      
+      - name: Run integration tests
+        env:
+          API_URL: https://staging.pantrypal.app
+          TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
+          TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
+        run: |
+          pytest tests/integration/ -v --junit-xml=integration-results.xml
+      
+      - name: Upload integration test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-results
+          path: integration-results.xml
+
+  # ==========================================================================
+  # Stage 7: Deploy to Production (Manual Approval)
+  # ==========================================================================
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [build, integration-tests]
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+      
+      - name: Get GKE credentials
+        run: |
+          gcloud container clusters get-credentials ${{ env.PRODUCTION_CLUSTER }} \
+            --region ${{ env.GCP_REGION }} \
+            --project ${{ env.PROJECT_ID }}
+      
+      - name: Backup current deployment
+        run: |
+          kubectl get deployment backend-api -n pantrypal-production -o yaml > backup-deployment.yaml
+      
+      - name: Update deployment image
+        run: |
+          kubectl set image deployment/backend-api \
+            backend-api=${{ env.REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            -n pantrypal-production
+      
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/backend-api \
+            -n pantrypal-production \
+            --timeout=10m
+      
+      - name: Verify deployment
+        run: |
+          kubectl get pods -n pantrypal-production -l app=backend-api
+          kubectl logs -n pantrypal-production -l app=backend-api --tail=50
+      
+      - name: Health check
+        run: |
+          curl -f https://pantrypal.app/health || exit 1
+      
+      - name: Notify Slack
+        if: always()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          text: |
+            Backend deployment to production: ${{ job.status }}
+            Commit: ${{ github.sha }}
+            Author: ${{ github.actor }}
+          webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+
+  # ==========================================================================
+  # Rollback (Manual Trigger)
+  # ==========================================================================
+  rollback:
+    name: Rollback Production
+    runs-on: ubuntu-latest
+    if: failure() && github.ref == 'refs/heads/main'
+    needs: deploy-production
+    
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+      
+      - name: Get GKE credentials
+        run: |
+          gcloud container clusters get-credentials ${{ env.PRODUCTION_CLUSTER }} \
+            --region ${{ env.GCP_REGION }} \
+            --project ${{ env.PROJECT_ID }}
+      
+      - name: Rollback deployment
+        run: |
+          kubectl rollout undo deployment/backend-api -n pantrypal-production
+      
+      - name: Wait for rollback
+        run: |
+          kubectl rollout status deployment/backend-api \
+            -n pantrypal-production \
+            --timeout=5m
+      
+      - name: Notify Slack
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          custom_payload: |
+            {
+              text: "🚨 Production deployment failed and was rolled back",
+              attachments: [{
+                color: 'danger',
+                text: `Commit ${process.env.AS_COMMIT} by ${process.env.AS_AUTHOR} was rolled back`
+              }]
+            }
+          webhook-url: ${{ secrets.SLACK_WEBHOOK }}

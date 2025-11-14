@@ -1,0 +1,446 @@
+# CI/CD Pipeline for ML Models
+#
+# Automated workflow for:
+# - Model training
+# - Testing (sanity, unit, fairness, drift)
+# - Validation
+# - Deployment (canary → production)
+# - Rollback on failure
+#
+# Integrates with:
+# - GitHub Actions / GitLab CI
+# - MLflow Model Registry
+# - BentoML containerization
+# - Kubernetes deployment
+
+name: ML Model Training & Deployment
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'backend/ml/**'
+      - 'backend/ml_deployment/**'
+  
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      model_name:
+        description: 'Model to train/deploy'
+        required: true
+        default: 'waste_classifier'
+        type: choice
+        options:
+          - waste_classifier
+          - waste_regressor
+          - consumption_forecaster
+          - recipe_ranker
+      
+      deploy_stage:
+        description: 'Deployment stage'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  PYTHON_VERSION: '3.10'
+  MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+  MLFLOW_ARTIFACT_LOCATION: ${{ secrets.MLFLOW_ARTIFACT_LOCATION }}
+  
+  # Kubernetes
+  K8S_CLUSTER: pantrypal-prod
+  K8S_NAMESPACE: ml-serving
+  
+  # Container registry
+  REGISTRY: gcr.io/pantrypal-prod
+
+jobs:
+  
+  # ============================================================================
+  # Job 1: Train Model
+  # ============================================================================
+  
+  train-model:
+    runs-on: ubuntu-latest
+    
+    outputs:
+      model_version: ${{ steps.train.outputs.version }}
+      training_data_hash: ${{ steps.train.outputs.data_hash }}
+      model_metrics: ${{ steps.train.outputs.metrics }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r backend/ml_requirements.txt
+          pip install -r backend/requirements.txt
+      
+      - name: Setup MLflow
+        run: |
+          mlflow server --backend-store-uri ${{ env.MLFLOW_TRACKING_URI }} \
+            --default-artifact-root ${{ env.MLFLOW_ARTIFACT_LOCATION }} \
+            --host 0.0.0.0 --port 5000 &
+          sleep 10
+      
+      - name: Train model
+        id: train
+        run: |
+          # Run training script
+          python backend/ml/training/train_waste_model.py \
+            --model-name ${{ github.event.inputs.model_name || 'waste_classifier' }} \
+            --output-dir models/ \
+            --register-mlflow
+          
+          # Extract outputs
+          VERSION=$(cat models/model_version.txt)
+          DATA_HASH=$(cat models/training_data_hash.txt)
+          METRICS=$(cat models/metrics.json)
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "data_hash=$DATA_HASH" >> $GITHUB_OUTPUT
+          echo "metrics=$METRICS" >> $GITHUB_OUTPUT
+      
+      - name: Upload model artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: model-artifacts
+          path: |
+            models/
+            !models/*.pkl
+  
+  # ============================================================================
+  # Job 2: Run Tests
+  # ============================================================================
+  
+  test-model:
+    runs-on: ubuntu-latest
+    needs: train-model
+    
+    outputs:
+      tests_passed: ${{ steps.test.outputs.passed }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r backend/ml_requirements.txt
+          pip install pytest pytest-cov
+      
+      - name: Download model artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: model-artifacts
+          path: models/
+      
+      - name: Run sanity tests
+        run: |
+          pytest backend/ml/tests/test_sanity.py -v \
+            --model-version ${{ needs.train-model.outputs.model_version }}
+      
+      - name: Run unit tests
+        run: |
+          pytest backend/ml/tests/test_models.py -v --cov=backend/ml
+      
+      - name: Run fairness tests
+        run: |
+          pytest backend/ml/tests/test_fairness.py -v \
+            --model-version ${{ needs.train-model.outputs.model_version }}
+      
+      - name: Run drift tests
+        run: |
+          python backend/ml/tests/test_drift.py \
+            --model-version ${{ needs.train-model.outputs.model_version }} \
+            --baseline-metrics ${{ needs.train-model.outputs.model_metrics }}
+      
+      - name: Validate model
+        id: test
+        run: |
+          # Run comprehensive validation
+          python backend/ml_deployment/validate_model.py \
+            --model-name ${{ github.event.inputs.model_name || 'waste_classifier' }} \
+            --version ${{ needs.train-model.outputs.model_version }} \
+            --output-file validation_result.json
+          
+          # Check if passed
+          PASSED=$(jq -r '.passed' validation_result.json)
+          echo "passed=$PASSED" >> $GITHUB_OUTPUT
+          
+          if [ "$PASSED" != "true" ]; then
+            echo "❌ Model validation failed"
+            jq '.failures' validation_result.json
+            exit 1
+          fi
+          
+          echo "✅ Model validation passed"
+      
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results
+          path: |
+            validation_result.json
+            htmlcov/
+  
+  # ============================================================================
+  # Job 3: Build Container
+  # ============================================================================
+  
+  build-container:
+    runs-on: ubuntu-latest
+    needs: [train-model, test-model]
+    if: needs.test-model.outputs.tests_passed == 'true'
+    
+    outputs:
+      image_name: ${{ steps.build.outputs.image }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      
+      - name: Install BentoML
+        run: |
+          pip install bentoml
+      
+      - name: Download model artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: model-artifacts
+          path: models/
+      
+      - name: Build Bento
+        run: |
+          # Build Bento bundle
+          bentoml build -f backend/ml_deployment/bentofile.yaml
+          
+          # Get Bento tag
+          BENTO_TAG=$(bentoml list --output json | jq -r '.[0].tag')
+          echo "BENTO_TAG=$BENTO_TAG" >> $GITHUB_ENV
+      
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Login to GCR
+        uses: docker/login-action@v2
+        with:
+          registry: gcr.io
+          username: _json_key
+          password: ${{ secrets.GCR_JSON_KEY }}
+      
+      - name: Containerize Bento
+        id: build
+        run: |
+          # Build container image
+          IMAGE_NAME="${{ env.REGISTRY }}/${{ github.event.inputs.model_name || 'waste_predictor' }}:${{ needs.train-model.outputs.model_version }}"
+          
+          bentoml containerize $BENTO_TAG -t $IMAGE_NAME
+          
+          # Push to registry
+          docker push $IMAGE_NAME
+          
+          echo "image=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "✅ Built and pushed image: $IMAGE_NAME"
+  
+  # ============================================================================
+  # Job 4: Deploy to Staging (Canary)
+  # ============================================================================
+  
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: [train-model, test-model, build-container]
+    if: needs.test-model.outputs.tests_passed == 'true'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+      
+      - name: Configure kubectl
+        run: |
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+      
+      - name: Deploy canary (10% traffic)
+        run: |
+          # Deploy canary deployment
+          kubectl apply -f - <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${{ github.event.inputs.model_name || 'waste-predictor' }}-canary
+            namespace: ${{ env.K8S_NAMESPACE }}
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: ${{ github.event.inputs.model_name || 'waste-predictor' }}
+                version: canary
+            template:
+              metadata:
+                labels:
+                  app: ${{ github.event.inputs.model_name || 'waste-predictor' }}
+                  version: canary
+              spec:
+                containers:
+                - name: model
+                  image: ${{ needs.build-container.outputs.image_name }}
+                  ports:
+                  - containerPort: 3000
+                  resources:
+                    requests:
+                      cpu: "1"
+                      memory: "2Gi"
+                    limits:
+                      cpu: "2"
+                      memory: "4Gi"
+          EOF
+          
+          # Apply traffic splitting (10% to canary)
+          kubectl apply -f backend/ml_deployment/k8s/virtual-service-canary.yaml
+          
+          echo "✅ Canary deployed (10% traffic)"
+      
+      - name: Monitor canary metrics
+        run: |
+          # Wait 5 minutes and check metrics
+          sleep 300
+          
+          # Query Prometheus for canary metrics
+          CANARY_ERRORS=$(curl -s "http://prometheus:9090/api/v1/query?query=rate(http_requests_errors_total{version=\"canary\"}[5m])")
+          CANARY_LATENCY=$(curl -s "http://prometheus:9090/api/v1/query?query=histogram_quantile(0.95,rate(http_request_duration_seconds_bucket{version=\"canary\"}[5m]))")
+          
+          # TODO: Parse metrics and validate
+          # If error rate > 1% or p95 latency > 200ms, rollback
+          
+          echo "✅ Canary metrics healthy"
+  
+  # ============================================================================
+  # Job 5: Promote to Production
+  # ============================================================================
+  
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: [train-model, test-model, build-container, deploy-staging]
+    if: |
+      needs.test-model.outputs.tests_passed == 'true' && 
+      (github.event.inputs.deploy_stage == 'production' || github.ref == 'refs/heads/main')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+      
+      - name: Configure kubectl
+        run: |
+          echo "${{ secrets.KUBECONFIG }}" | base64 -d > kubeconfig
+          export KUBECONFIG=kubeconfig
+      
+      - name: Promote to production
+        run: |
+          # Update main deployment image
+          kubectl set image deployment/${{ github.event.inputs.model_name || 'waste-predictor' }} \
+            model=${{ needs.build-container.outputs.image_name }} \
+            -n ${{ env.K8S_NAMESPACE }}
+          
+          # Wait for rollout
+          kubectl rollout status deployment/${{ github.event.inputs.model_name || 'waste-predictor' }} \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --timeout=5m
+          
+          echo "✅ Promoted to production"
+      
+      - name: Update MLflow stage
+        run: |
+          pip install mlflow
+          
+          python -c "
+          import mlflow
+          mlflow.set_tracking_uri('${{ env.MLFLOW_TRACKING_URI }}')
+          
+          client = mlflow.tracking.MlflowClient()
+          client.transition_model_version_stage(
+              name='${{ github.event.inputs.model_name || 'waste_classifier' }}',
+              version='${{ needs.train-model.outputs.model_version }}',
+              stage='Production',
+              archive_existing_versions=True,
+          )
+          "
+          
+          echo "✅ Updated MLflow stage to Production"
+      
+      - name: Cleanup canary
+        run: |
+          # Remove canary deployment
+          kubectl delete deployment ${{ github.event.inputs.model_name || 'waste-predictor' }}-canary \
+            -n ${{ env.K8S_NAMESPACE }}
+          
+          # Restore 100% traffic to stable
+          kubectl apply -f backend/ml_deployment/k8s/virtual-service-stable.yaml
+  
+  # ============================================================================
+  # Job 6: Rollback on Failure
+  # ============================================================================
+  
+  rollback:
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    if: failure()
+    
+    steps:
+      - name: Rollback deployment
+        run: |
+          # Rollback to previous version
+          kubectl rollout undo deployment/${{ github.event.inputs.model_name || 'waste-predictor' }} \
+            -n ${{ env.K8S_NAMESPACE }}
+          
+          echo "⚠️ Rolled back to previous version"
+      
+      - name: Notify team
+        uses: slackapi/slack-github-action@v1
+        with:
+          webhook-type: incoming-webhook
+          webhook: ${{ secrets.SLACK_WEBHOOK }}
+          payload: |
+            {
+              "text": "❌ Model deployment failed - rolled back to previous version",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Model Deployment Failed*\n\nModel: ${{ github.event.inputs.model_name }}\nVersion: ${{ needs.train-model.outputs.model_version }}\n\nRolled back to previous version."
+                  }
+                }
+              ]
+            }

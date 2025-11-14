@@ -1,0 +1,13 @@
+{
+  "name": "@pantrypal/ai-server",
+  "version": "1.0.0",
+  "description": "Server-only AI modules for PantryPal",
+  "main": "./genkit.ts",
+  "exports": {
+    ".": {
+      "import": "./genkit.ts",
+      "types": "./genkit.ts"
+    }
+  },
+  "sideEffects": false
+}

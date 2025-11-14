@@ -1,0 +1,44 @@
+# ============================================================================
+# PantryPal Airflow - Custom Dockerfile
+# Extends official Airflow image with ML dependencies
+# ============================================================================
+
+FROM apache/airflow:2.8.0-python3.11
+
+# Switch to root for installations
+USER root
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Switch back to airflow user
+USER airflow
+
+# Set working directory
+WORKDIR /opt/airflow
+
+# Copy requirements
+COPY backend/ml/requirements.txt /tmp/ml_requirements.txt
+COPY backend/requirements.txt /tmp/backend_requirements.txt
+
+# Install Python dependencies
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir -r /tmp/ml_requirements.txt && \
+    pip install --no-cache-dir -r /tmp/backend_requirements.txt
+
+# Copy DAGs
+COPY --chown=airflow:root backend/ml/dags /opt/airflow/dags
+
+# Copy ML code
+COPY --chown=airflow:root backend/ml /opt/airflow/backend/ml
+COPY --chown=airflow:root backend/shared /opt/airflow/backend/shared
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+# Use default Airflow CMD

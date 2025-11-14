@@ -1,0 +1,245 @@
+# Prometheus Alerting Rules
+# Alerts for PantryPal ML infrastructure
+
+groups:
+  
+  # ============================================================================
+  # ML Model Serving Alerts
+  # ============================================================================
+  
+  - name: ml_model_alerts
+    interval: 30s
+    rules:
+      
+      # High error rate
+      - alert: MLModelHighErrorRate
+        expr: |
+          (
+            rate(ml_prediction_errors_total[5m]) 
+            / rate(ml_prediction_requests_total[5m])
+          ) > 0.01
+        for: 5m
+        labels:
+          severity: critical
+          component: ml-serving
+        annotations:
+          summary: "ML model error rate above 1%"
+          description: |
+            Model {{ $labels.model_name }} version {{ $labels.version }} 
+            has error rate {{ $value | humanizePercentage }}.
+            Current: {{ $value | humanizePercentage }}
+            Threshold: 1%
+      
+      # High latency
+      - alert: MLModelHighLatency
+        expr: |
+          histogram_quantile(0.95,
+            rate(ml_prediction_duration_seconds_bucket[5m])
+          ) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          component: ml-serving
+        annotations:
+          summary: "ML model P95 latency above 200ms"
+          description: |
+            Model {{ $labels.model_name }} P95 latency is {{ $value }}s.
+            Current: {{ $value | humanizeDuration }}
+            Threshold: 200ms
+      
+      # Model drift (performance degradation)
+      - alert: MLModelDrift
+        expr: ml_model_auc < 0.75
+        for: 1h
+        labels:
+          severity: warning
+          component: ml-model
+        annotations:
+          summary: "ML model AUC dropped below threshold"
+          description: |
+            Model {{ $labels.model_name }} AUC is {{ $value | printf "%.3f" }}.
+            Current: {{ $value | printf "%.3f" }}
+            Threshold: 0.75
+            Action: Retrain model
+      
+      # Low request volume (possible issue)
+      - alert: MLModelLowVolume
+        expr: |
+          rate(ml_prediction_requests_total[5m]) < 1
+        for: 15m
+        labels:
+          severity: info
+          component: ml-serving
+        annotations:
+          summary: "ML model receiving low traffic"
+          description: |
+            Model {{ $labels.model_name }} receiving {{ $value | printf "%.2f" }} req/s.
+            Current: {{ $value | printf "%.2f" }} req/s
+            Expected: >1 req/s
+  
+  # ============================================================================
+  # Data Ingestion Alerts
+  # ============================================================================
+  
+  - name: ingestion_alerts
+    interval: 30s
+    rules:
+      
+      # High processing time
+      - alert: IngestionHighLatency
+        expr: |
+          histogram_quantile(0.95,
+            rate(ingestion_processing_time_bucket[5m])
+          ) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+          component: ingestion
+        annotations:
+          summary: "Ingestion P95 latency above 500ms"
+          description: |
+            Source {{ $labels.source }} P95 latency is {{ $value }}s.
+            Current: {{ $value | humanizeDuration }}
+            Threshold: 500ms
+      
+      # Queue backlog
+      - alert: IngestionQueueBacklog
+        expr: ingestion_queue_depth > 10000
+        for: 5m
+        labels:
+          severity: warning
+          component: ingestion
+        annotations:
+          summary: "Ingestion queue depth above 10k"
+          description: |
+            Queue depth is {{ $value }}.
+            Current: {{ $value }}
+            Threshold: 10,000
+            Action: Scale up workers
+      
+      # Low canonicalization confidence
+      - alert: IngestionLowConfidence
+        expr: |
+          (
+            sum(rate(ingestion_low_confidence_total[5m]))
+            / sum(rate(ingestion_processed_total[5m]))
+          ) > 0.5
+        for: 15m
+        labels:
+          severity: info
+          component: ingestion
+        annotations:
+          summary: "High rate of low-confidence canonicalizations"
+          description: |
+            {{ $value | humanizePercentage }} of items need human review.
+            Current: {{ $value | humanizePercentage }}
+            Threshold: 50%
+            Action: Update canonicalization model
+  
+  # ============================================================================
+  # Infrastructure Alerts
+  # ============================================================================
+  
+  - name: infrastructure_alerts
+    interval: 30s
+    rules:
+      
+      # Container down
+      - alert: ContainerDown
+        expr: up{job=~"bentoml-serving|fastapi-backend"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: infrastructure
+        annotations:
+          summary: "Container {{ $labels.job }} is down"
+          description: |
+            Container {{ $labels.instance }} for job {{ $labels.job }} is down.
+            Duration: 2+ minutes
+            Action: Check container logs
+      
+      # High CPU usage
+      - alert: HighCPUUsage
+        expr: |
+          (
+            rate(process_cpu_seconds_total[5m]) * 100
+          ) > 80
+        for: 10m
+        labels:
+          severity: warning
+          component: infrastructure
+        annotations:
+          summary: "High CPU usage on {{ $labels.instance }}"
+          description: |
+            CPU usage is {{ $value | printf "%.1f" }}%.
+            Current: {{ $value | printf "%.1f" }}%
+            Threshold: 80%
+      
+      # High memory usage
+      - alert: HighMemoryUsage
+        expr: |
+          (
+            process_resident_memory_bytes
+            / node_memory_MemTotal_bytes
+          ) > 0.9
+        for: 5m
+        labels:
+          severity: critical
+          component: infrastructure
+        annotations:
+          summary: "High memory usage on {{ $labels.instance }}"
+          description: |
+            Memory usage is {{ $value | humanizePercentage }}.
+            Current: {{ $value | humanizePercentage }}
+            Threshold: 90%
+            Action: Scale horizontally
+      
+      # Redis down
+      - alert: RedisDown
+        expr: up{job="redis"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: redis
+        annotations:
+          summary: "Redis is down"
+          description: |
+            Redis instance {{ $labels.instance }} is down.
+            Impact: Ingestion deduplication disabled
+            Action: Restart Redis container
+      
+      # PostgreSQL down
+      - alert: PostgresDown
+        expr: up{job="postgres"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          component: postgres
+        annotations:
+          summary: "PostgreSQL is down"
+          description: |
+            PostgreSQL instance {{ $labels.instance }} is down.
+            Impact: Database queries failing
+            Action: Restart PostgreSQL container
+  
+  # ============================================================================
+  # MLflow Alerts
+  # ============================================================================
+  
+  - name: mlflow_alerts
+    interval: 30s
+    rules:
+      
+      # MLflow down
+      - alert: MLflowDown
+        expr: up{job="mlflow"} == 0
+        for: 5m
+        labels:
+          severity: warning
+          component: mlflow
+        annotations:
+          summary: "MLflow tracking server is down"
+          description: |
+            MLflow tracking server is unreachable.
+            Impact: Model training/registration unavailable
+            Action: Check MLflow container logs

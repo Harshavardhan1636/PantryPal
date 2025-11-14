@@ -1,0 +1,19 @@
+service: "service:svc"
+description: "PantryPal Waste Risk Prediction Service"
+labels:
+  owner: pantrypal
+  stage: production
+include:
+  - "*.py"
+  - "models/"
+  - "requirements.txt"
+python:
+  packages:
+    - numpy==1.26.4
+    - pandas==2.2.3
+    - scikit-learn==1.5.2
+    - lightgbm==4.5.0
+    - pydantic==2.10.3
+docker:
+  distro: debian
+  python_version: "3.11"

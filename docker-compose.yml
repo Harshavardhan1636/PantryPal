@@ -1,0 +1,314 @@
+version: '3.8'
+
+services:
+  # ====================
+  # DATABASES
+  # ====================
+  postgres:
+    image: timescale/timescaledb:latest-pg15
+    container_name: pantrypal-postgres
+    environment:
+      POSTGRES_USER: pantrypal
+      POSTGRES_PASSWORD: pantrypal_dev_password
+      POSTGRES_DB: pantrypal
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/database/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pantrypal"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: pantrypal-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ====================
+  # BACKEND SERVICES
+  # ====================
+  auth-service:
+    build:
+      context: ./backend/auth_service
+      dockerfile: Dockerfile
+    container_name: pantrypal-auth
+    ports:
+      - "8001:8001"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://pantrypal:pantrypal_dev_password@postgres:5432/pantrypal
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET_KEY: dev-secret-key-change-in-production
+      CORS_ORIGINS: http://localhost:3000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend/auth_service:/app
+      - ./backend/shared:/app/shared
+    command: uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+
+  inventory-service:
+    build:
+      context: ./backend/inventory_service
+      dockerfile: Dockerfile
+    container_name: pantrypal-inventory
+    ports:
+      - "8002:8002"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://pantrypal:pantrypal_dev_password@postgres:5432/pantrypal
+      REDIS_URL: redis://redis:6379
+      ML_SERVICE_URL: http://ml-service:3000
+      CORS_ORIGINS: http://localhost:3000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend/inventory_service:/app
+      - ./backend/shared:/app/shared
+    command: uvicorn main:app --host 0.0.0.0 --port 8002 --reload
+
+  # ====================
+  # ML API SERVICE
+  # ====================
+  ml-api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: pantrypal-ml-api
+    ports:
+      - "8003:5000"
+    environment:
+      FLASK_ENV: development
+      MODEL_DIR: /app/models
+      DATABASE_URL: postgresql+asyncpg://pantrypal:pantrypal_dev_password@postgres:5432/pantrypal
+      REDIS_URL: redis://redis:6379
+      CORS_ORIGINS: http://localhost:3000,http://localhost:9002
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend/api:/app/api
+      - ./models:/app/models
+    command: python api/app.py
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ====================
+  # MLFLOW TRACKING SERVER (Optional - ML Training)
+  # ====================
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.9.2
+    container_name: pantrypal-mlflow
+    ports:
+      - "5000:5000"
+    environment:
+      MLFLOW_BACKEND_STORE_URI: postgresql://pantrypal:pantrypal_dev_password@postgres:5432/mlflow
+      MLFLOW_ARTIFACT_ROOT: /mlflow/artifacts
+      MLFLOW_TRACKING_URI: http://0.0.0.0:5000
+    volumes:
+      - mlflow_artifacts:/mlflow/artifacts
+    command: >
+      mlflow server
+      --backend-store-uri postgresql://pantrypal:pantrypal_dev_password@postgres:5432/mlflow
+      --default-artifact-root /mlflow/artifacts
+      --host 0.0.0.0
+      --port 5000
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    profiles:
+      - ml-training
+
+  # ====================
+  # AIRFLOW (Workflow Orchestration)
+  # ====================
+  airflow-postgres:
+    image: postgres:15-alpine
+    container_name: pantrypal-airflow-db
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    profiles:
+      - ml-training
+
+  airflow-init:
+    image: apache/airflow:2.7.3-python3.10
+    container_name: pantrypal-airflow-init
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: 'UKMzEm3yIuFYEq1y3-2FxR3c7_K4iN8V5GQ7I9r8Fy0='
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__WEBSERVER__SECRET_KEY: 'dev-secret-key'
+      _AIRFLOW_DB_UPGRADE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+    volumes:
+      - ./backend/ml/dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+    command: version
+    profiles:
+      - ml-training
+
+  airflow-webserver:
+    image: apache/airflow:2.7.3-python3.10
+    container_name: pantrypal-airflow-webserver
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: 'UKMzEm3yIuFYEq1y3-2FxR3c7_K4iN8V5GQ7I9r8Fy0='
+      AIRFLOW__WEBSERVER__SECRET_KEY: 'dev-secret-key'
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      DATABASE_URL: postgresql+asyncpg://pantrypal:pantrypal_dev_password@postgres:5432/pantrypal
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./backend/ml/dags:/opt/airflow/dags
+      - ./backend/ml:/opt/airflow/ml
+      - ./backend/shared:/opt/airflow/shared
+      - airflow_logs:/opt/airflow/logs
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+      mlflow:
+        condition: service_healthy
+    command: webserver
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    profiles:
+      - ml-training
+
+  airflow-scheduler:
+    image: apache/airflow:2.7.3-python3.10
+    container_name: pantrypal-airflow-scheduler
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres:5432/airflow
+      AIRFLOW__CORE__FERNET_KEY: 'UKMzEm3yIuFYEq1y3-2FxR3c7_K4iN8V5GQ7I9r8Fy0='
+      AIRFLOW__WEBSERVER__SECRET_KEY: 'dev-secret-key'
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      DATABASE_URL: postgresql+asyncpg://pantrypal:pantrypal_dev_password@postgres:5432/pantrypal
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    volumes:
+      - ./backend/ml/dags:/opt/airflow/dags
+      - ./backend/ml:/opt/airflow/ml
+      - ./backend/shared:/opt/airflow/shared
+      - airflow_logs:/opt/airflow/logs
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+      mlflow:
+        condition: service_healthy
+    command: scheduler
+    profiles:
+      - ml-training
+
+  # ====================
+  # FRONTEND
+  # ====================
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: pantrypal-frontend
+    ports:
+      - "9002:9002"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8003
+      NEXT_PUBLIC_AUTH_API: http://localhost:8001
+      NEXT_PUBLIC_INVENTORY_API: http://localhost:8002
+    volumes:
+      - .:/app
+      - /app/node_modules
+      - /app/.next
+    command: npm run dev
+    depends_on:
+      - auth-service
+      - inventory-service
+      - ml-api
+
+  # ====================
+  # DEVELOPMENT TOOLS
+  # ====================
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: pantrypal-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@pantrypal.local
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    profiles:
+      - tools
+
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: pantrypal-redis-commander
+    environment:
+      REDIS_HOSTS: local:redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    profiles:
+      - tools
+
+volumes:
+  postgres_data:
+  redis_data:
+  ml_models:
+  mlflow_artifacts:
+  airflow_postgres_data:
+  airflow_logs:
+
+networks:
+  default:
+    name: pantrypal-network
